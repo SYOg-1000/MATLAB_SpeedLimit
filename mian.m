@@ -78,8 +78,17 @@ function process_single_image(origin_img, img_name, templates)
     hFig = figure('Name', ['TSR | ' img_name], 'NumberTitle', 'off', ...
                   'Position', [50, 50, 1200, 800], 'Color', [0.9 0.9 0.9]);
     
+    if isempty(roi_cells)
+        fprintf('  -> [定位] 终极兜底也未检出 ROI，图像中无红色圆状区域。\n');
+        return;
+    end
+    
+    ql = sign_metas{1}.quality_level;
+    level_label = {'严格', '放宽', '很宽', '兜底'};
+    
     % ① 原始图像与 NMS 定位框
-    subplot(2, 3, 1); imshow(origin_img); title('① 原始图像与 NMS 定位框'); hold on;
+    subplot(2, 3, 1); imshow(origin_img);
+    title(sprintf('① 原始图像与 NMS 定位框 [L%d-%s]', ql, level_label{ql})); hold on;
     colors_box = {'cyan', 'yellow', 'lime', 'magenta'};
     for k = 1:length(roi_bboxes)
         bb = roi_bboxes{k};
@@ -93,12 +102,8 @@ function process_single_image(origin_img, img_name, templates)
     subplot(2, 3, 2); imshow(V_enhanced); title('② CLAHE 增强 V 通道');
     
     % ③ 形态学纯化红色掩膜
-    subplot(2, 3, 3); imshow(mask_final); title('③ 形态学纯化红色掩膜');
-    
-    if isempty(roi_cells)
-        fprintf('  -> [定位] 未检测到符合条件的限速标志。\n');
-        return;
-    end
+    subplot(2, 3, 3); imshow(mask_final);
+    title(sprintf('③ 形态学纯化红色掩膜 [L%d]', ql));
     
     % Step 3: 逐候选标志处理 (提取、分割、识别)
     all_results = {};
@@ -123,7 +128,7 @@ function process_single_image(origin_img, img_name, templates)
         end
         all_results{k} = speed_val;
         
-        fprintf('  -> 标志 #%d: 识别结果 = %s km/h (置信度: %.1f%%)\n', k, speed_val, confidence*100);
+        fprintf('  -> 标志 #%d [L%d]: 识别结果 = %s km/h (置信度: %.1f%%)\n', k, ql, speed_val, confidence*100);
         
         % 只详细展示第一个检测到的标志的中间过程
         if k == 1 
@@ -163,66 +168,105 @@ function [mask_red, V_enhanced] = color_segment_red(rgb_img)
     hsv_img = rgb2hsv(double(rgb_img) / 255);   %RGB changed to HSV, 归一化到 [0, 1]
     H = hsv_img(:,:,1); S = hsv_img(:,:,2); V = hsv_img(:,:,3); % 提取 HSV 通道
     
-    % CLAHE 增强: 极大改善暗光/过曝场景的对比度 (如 60-3.png)
-    % --- 可调参数 ---
-    CLAHE_NumTiles = [8 8];        % 区域划分数目: [n m]，值越小对比度越强
-    CLAHE_ClipLimit = 0.02;        % 对比度增强限制: 值越小对比度越强
-
-    V_enhanced = adapthisteq(V, 'NumTiles', CLAHE_NumTiles, 'ClipLimit', CLAHE_ClipLimit);  %将HSV的V通道增强对比度，划分8*8个区域，对比度阈值0.02
+    % CLAHE 增强: 极大改善暗光/过曝场景的对比度
+    CLAHE_NumTiles = [8 8];
+    CLAHE_ClipLimit = 0.01;
+    V_enhanced = adapthisteq(V, 'NumTiles', CLAHE_NumTiles, 'ClipLimit', CLAHE_ClipLimit);
     
     % 红色双区间掩膜 (HSV 色相环 0 附近和 1 附近均为红色)
-    mask_low  = (H <= 0.08) & (S > 0.35) & (V_enhanced > 0.15);
-    mask_high = (H >= 0.92) & (S > 0.35) & (V_enhanced > 0.15);
+    % 放宽阈值以适应实际拍摄场景: 红圈更小、饱和度更低、亮度更暗
+    mask_low  = (H <= 0.10) & (S > 0.25) & (V_enhanced > 0.10);
+    mask_high = (H >= 0.90) & (S > 0.25) & (V_enhanced > 0.10);
     mask_union = mask_low | mask_high;
     
-    % 形态学开运算消除孤立噪点
-    mask_red = imopen(mask_union, strel('disk', 2));
+    % 形态学开运算消除孤立噪点 (缩小半径避免抹除小红圈细边)
+    mask_red = imopen(mask_union, strel('disk', 1));
 end
 
 % =========================================================================
-% 模块 B: 多准则连通域筛选 + IoU-NMS 
+% 模块 B: 多准则连通域筛选 + IoU-NMS (4级渐进松弛)
+%   L1: 严格参数, 适合标准清晰大标志
+%   L2: 放宽形态学面积和几何约束
+%   L3: 大幅放宽所有几何约束
+%   L4: 终极兜底, 保证不返回空 (识别模块做最终判断)
 % =========================================================================
 function [roi_cells, roi_bboxes, mask_final, sign_metas] = locate_signs_robust(origin_img, mask_red)
     roi_cells = {}; roi_bboxes = {}; sign_metas = {};
     
-    % 闭运算连接断裂弧段，填孔使得圆环变实心大饼
-    mask_closed = imclose(mask_red, strel('disk', 8));
-    mask_filled = imfill(mask_closed, 'holes');
-    mask_final = mask_filled;
+    [img_h, img_w, ~] = size(origin_img);
+    red_density = sum(mask_red(:)) / (img_h * img_w);
     
-    stats = regionprops(mask_filled, 'Area', 'BoundingBox', 'Perimeter', 'Extent', 'MajorAxisLength', 'MinorAxisLength');
-    if isempty(stats), return; end
+    close_radii  = [0,   15,  20,  25];  % 0=L1自适应
+    abs_areas    = [200, 100, 50,  20];
+    rel_areas    = [0.05, 0.02, 0.01, 0];
+    extents      = [0.45, 0.35, 0.25, 0.15];
+    max_ars      = [2.5,  3.5,  5.0,  10.0];
+    min_circs    = [0.40, 0.25, 0.10, 0.05];
     
-    max_area = max([stats.Area]);
-    candidate_idx = [];
+    quality_level = 4;
+    final_idx = [];
+    final_stats = [];
     
-    % 联合多准则筛选
-    for i = 1:length(stats)
-        A = stats(i).Area; P = stats(i).Perimeter; Ext = stats(i).Extent;
-        if P < 1, continue; end
-        circ = (4 * pi * A) / (P^2); % 圆形度
-        AR = stats(i).MajorAxisLength / max(stats(i).MinorAxisLength, 1); % 长宽比
+    for level = 1:4
+        if level == 1
+            if red_density < 0.005
+                close_r = 12;
+            else
+                close_r = 8;
+            end
+        else
+            close_r = close_radii(level);
+        end
         
-        % 面积够大 + 矩形度合理 + 圆形度/长宽比容忍透视变形
-        if (A > 600) && (A > max_area * 0.10) && (Ext > 0.45) && (AR < 2.5) && (circ > 0.40)
-            candidate_idx(end+1) = i;
+        mask_closed = imclose(mask_red, strel('disk', close_r));
+        mask_filled = imfill(mask_closed, 'holes');
+        
+        if level == 1
+            mask_final = mask_filled;
+        end
+        
+        stats = regionprops(mask_filled, 'Area', 'BoundingBox', 'Perimeter', 'Extent', 'MajorAxisLength', 'MinorAxisLength');
+        if isempty(stats), continue; end
+        
+        max_area = max([stats.Area]);
+        candidate_idx = [];
+        
+        for i = 1:length(stats)
+            A = stats(i).Area; P = stats(i).Perimeter; Ext = stats(i).Extent;
+            if P < 1, continue; end
+            circ = (4 * pi * A) / (P^2);
+            AR = stats(i).MajorAxisLength / max(stats(i).MinorAxisLength, 1);
+            
+            if (A > abs_areas(level)) && (A > max_area * rel_areas(level)) ...
+               && (Ext > extents(level)) && (AR < max_ars(level)) && (circ > min_circs(level))
+                candidate_idx(end+1) = i;
+            end
+        end
+        
+        if ~isempty(candidate_idx)
+            cand_stats = stats(candidate_idx);
+            bboxes_mat = vertcat(cand_stats.BoundingBox);
+            areas_mat = [cand_stats.Area];
+            keep_flags = nms_boxes(bboxes_mat, areas_mat, 0.40);
+            final_idx = candidate_idx(keep_flags);
+            
+            if ~isempty(final_idx)
+                mask_final = mask_filled;
+                final_stats = stats;
+                quality_level = level;
+                break;
+            end
         end
     end
     
-    if isempty(candidate_idx), return; end
-    cand_stats = stats(candidate_idx);
+    if isempty(final_idx)
+        return;
+    end
     
-    % NMS (非极大抑制): 防止同一个标志牌被大框和小框重复截取
-    bboxes_mat = vertcat(cand_stats.BoundingBox);
-    areas_mat = [cand_stats.Area];
-    keep_flags = nms_boxes(bboxes_mat, areas_mat, 0.40);
-    final_idx = candidate_idx(keep_flags);
-    
-    % 截取 ROI
     [H_img, W_img, ~] = size(origin_img);
-    PAD = 15; % 向外扩展安全边界
+    PAD = 15;
     for i = 1:length(final_idx)
-        si = stats(final_idx(i)); bb = si.BoundingBox;
+        si = final_stats(final_idx(i)); bb = si.BoundingBox;
         x1 = max(floor(bb(1)) - PAD, 1);          y1 = max(floor(bb(2)) - PAD, 1);
         x2 = min(floor(bb(1) + bb(3)) + PAD, W_img); y2 = min(floor(bb(2) + bb(4)) + PAD, H_img);
         
@@ -230,7 +274,8 @@ function [roi_cells, roi_bboxes, mask_final, sign_metas] = locate_signs_robust(o
         roi_bboxes{end+1} = [x1, y1, x2-x1, y2-y1];
         
         circ_k = (4*pi*si.Area) / max(si.Perimeter^2, 1);
-        sign_metas{end+1} = struct('aspect_ratio', si.MajorAxisLength/max(si.MinorAxisLength,1), 'circularity', circ_k);
+        sign_metas{end+1} = struct('aspect_ratio', si.MajorAxisLength/max(si.MinorAxisLength,1), ...
+                                   'circularity', circ_k, 'quality_level', quality_level);
     end
 end
 
