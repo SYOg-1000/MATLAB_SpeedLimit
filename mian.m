@@ -286,41 +286,71 @@ end
 
 % =========================================================================
 % 模块 E: 字符分割与归一化 (大津法二值化 + 取反 + 拓扑排序)
+% 过滤策略: 宽松初筛 -> Y一致性聚类 -> 宽度一致性聚类
 % =========================================================================
 function [char_cells, bw_clean] = segment_chars(roi_img)
     char_cells = {};
     gray_img = rgb2gray(roi_img);
     
-    % 大津法二值化，并进行至关重要的取反 (~) 使得黑字变白目标 (1)
     bw = ~imbinarize(gray_img, graythresh(gray_img));
     
-    % 清除边界残留的红色外圈像素
     bw_clean = imclearborder(bw);
-    bw_clean = bwareaopen(bw_clean, 30); % 移除小于 30 像素的噪点
+    bw_clean = bwareaopen(bw_clean, 30);
     
-    stats = regionprops(bw_clean, 'BoundingBox', 'Area');
+    [img_h, img_w] = size(bw_clean);
+    mid_y = img_h / 2;
+    
+    stats = regionprops(bw_clean, 'BoundingBox', 'Area', 'Centroid');
     if isempty(stats), return; end
     
-    % 根据面积和长宽比初筛字符连通域
-    valid_bboxes = [];
+    cand_bboxes = [];
+    cand_cent_y = [];
     max_a = max([stats.Area]);
     for i = 1:length(stats)
         bb = stats(i).BoundingBox;
-        if stats(i).Area > max_a * 0.15 && bb(4)/bb(3) > 1.1 % 字符通常是瘦高的
-            valid_bboxes = [valid_bboxes; bb];
+        ratio = bb(4) / bb(3);
+        if stats(i).Area <= max_a * 0.15 || ratio < 0.60
+            continue;
         end
+        
+        cent_y = stats(i).Centroid(2);
+        if abs(cent_y - mid_y) > img_h * 0.40
+            continue;
+        end
+        
+        cand_bboxes = [cand_bboxes; bb];
+        cand_cent_y = [cand_cent_y; cent_y];
     end
     
-    if isempty(valid_bboxes), return; end
+    if isempty(cand_bboxes), return; end
     
-    % 核心: 按 X 坐标排序，确保 60 不会被识别为 06
-    [~, sort_idx] = sort(valid_bboxes(:, 1));
-    valid_bboxes = valid_bboxes(sort_idx, :);
+    n_cand = size(cand_bboxes, 1);
+    if n_cand > 2
+        bbox_areas = cand_bboxes(:, 3) .* cand_bboxes(:, 4);
+        [~, anchor_idx] = max(bbox_areas);
+        anchor_y = cand_cent_y(anchor_idx);
+        avg_w = mean(cand_bboxes(:, 3));
+        
+        keep = true(n_cand, 1);
+        for i = 1:n_cand
+            if abs(cand_cent_y(i) - anchor_y) > img_h * 0.15
+                keep(i) = false;
+                continue;
+            end
+            if cand_bboxes(i, 3) < avg_w * 0.45
+                keep(i) = false;
+            end
+        end
+        
+        cand_bboxes = cand_bboxes(keep, :);
+        if isempty(cand_bboxes), return; end
+    end
     
-    % 裁剪并归一化到 32x16
-    for i = 1:size(valid_bboxes, 1)
-        bb = valid_bboxes(i, :);
-        % 略微向外扩展确保不切掉字符边缘
+    [~, sort_idx] = sort(cand_bboxes(:, 1));
+    cand_bboxes = cand_bboxes(sort_idx, :);
+    
+    for i = 1:size(cand_bboxes, 1)
+        bb = cand_bboxes(i, :);
         x = max(floor(bb(1))-1, 1); y = max(floor(bb(2))-1, 1);
         w = min(ceil(bb(3))+2, size(bw_clean,2)-x); h = min(ceil(bb(4))+2, size(bw_clean,1)-y);
         
@@ -331,6 +361,7 @@ end
 
 % =========================================================================
 % 模块 F: 模板匹配核心 (corr2)
+% 第三层过滤: 低置信度字符拒绝，防止非数字字符混入识别结果
 % =========================================================================
 function [speed_val, confidence] = recognize_digits(char_cells, templates)
     speed_val = '';
@@ -349,10 +380,20 @@ function [speed_val, confidence] = recognize_digits(char_cells, templates)
                 best_digit = num2str(num);
             end
         end
+        
+        if max_corr < 0.15
+            best_digit = '?';
+        end
+        
         speed_val = [speed_val, best_digit];
         conf_list(end+1) = max_corr;
     end
-    confidence = mean(conf_list);
+    
+    if contains(speed_val, '?')
+        confidence = 0;
+    else
+        confidence = mean(conf_list);
+    end
 end
 
 % =========================================================================
