@@ -89,7 +89,7 @@ function process_single_image(origin_img, img_name, templates)
     % ① 原始图像与 NMS 定位框
     subplot(2, 3, 1); imshow(origin_img);
     title(sprintf('① 原始图像与 NMS 定位框 [L%d-%s]', ql, level_label{ql})); hold on;
-    colors_box = {'cyan', 'yellow', 'lime', 'magenta'};
+    colors_box = {'cyan', 'yellow', 'g', 'magenta'};
     for k = 1:length(roi_bboxes)
         bb = roi_bboxes{k};
         clr = colors_box{mod(k-1,4)+1};
@@ -247,10 +247,13 @@ function [roi_cells, roi_bboxes, mask_final, sign_metas] = locate_signs_robust(o
             cand_stats = stats(candidate_idx);
             bboxes_mat = vertcat(cand_stats.BoundingBox);
             areas_mat = [cand_stats.Area];
-            keep_flags = nms_boxes(bboxes_mat, areas_mat, 0.40);
+            fprintf('NMS前候选框数=%d\n', size(bboxes_mat, 1));
+            keep_flags = nms_boxes(bboxes_mat, areas_mat, 0.70);
             final_idx = candidate_idx(keep_flags);
             
             if ~isempty(final_idx)
+                fprintf('最终检测框数=%d\n', length(final_idx));
+                disp(bboxes_mat(keep_flags, :));
                 mask_final = mask_filled;
                 final_stats = stats;
                 quality_level = level;
@@ -400,7 +403,7 @@ function [char_cells, bw_clean] = segment_chars(roi_img)
         w = min(ceil(bb(3))+2, size(bw_clean,2)-x); h = min(ceil(bb(4))+2, size(bw_clean,1)-y);
         
         char_img = bw_clean(y:y+h, x:x+w);
-        char_cells{i} = imresize(char_img, [32, 16]);
+        char_cells{i} = imresize(char_img, [32, 16], 'nearest');
     end
 end
 
@@ -417,9 +420,11 @@ function [speed_val, confidence] = recognize_digits(char_cells, templates)
         max_corr = -1;
         best_digit = '?';
         
+        fprintf('\n===== 字符%d =====\n', i);
         for num = 0:9
             tpl = templates{num + 1};
             r = corr2(test_char, tpl);
+            fprintf('%d : %.4f\n', num, r);
             if r > max_corr
                 max_corr = r;
                 best_digit = num2str(num);
