@@ -74,9 +74,12 @@ function process_single_image(origin_img, img_name, templates)
     % Step 2: 多准则形态学定位与 IoU-NMS 多目标过滤
     [roi_cells, roi_bboxes, mask_final, sign_metas] = locate_signs_robust(origin_img, mask_red);
     
+    n_rois = length(roi_cells);
+    total_rows = 1 + n_rois;
+    
     % 可视化面板设置
     hFig = figure('Name', ['TSR | ' img_name], 'NumberTitle', 'off', ...
-                  'Position', [50, 50, 1200, 800], 'Color', [0.9 0.9 0.9]);
+                  'Position', [50, 50, 1200, max(800, 200 + n_rois * 250)], 'Color', [0.9 0.9 0.9]);
     
     if isempty(roi_cells)
         fprintf('  -> [定位] 终极兜底也未检出 ROI，图像中无红色圆状区域。\n');
@@ -87,7 +90,7 @@ function process_single_image(origin_img, img_name, templates)
     level_label = {'严格', '放宽', '很宽', '兜底'};
     
     % ① 原始图像与 NMS 定位框
-    subplot(2, 3, 1); imshow(origin_img);
+    subplot(total_rows, 3, 1); imshow(origin_img);
     title(sprintf('① 原始图像与 NMS 定位框 [L%d-%s]', ql, level_label{ql})); hold on;
     colors_box = {'cyan', 'yellow', 'g', 'magenta'};
     for k = 1:length(roi_bboxes)
@@ -99,10 +102,10 @@ function process_single_image(origin_img, img_name, templates)
     hold off;
     
     % ② CLAHE 增强 V 通道
-    subplot(2, 3, 2); imshow(V_enhanced); title('② CLAHE 增强 V 通道');
+    subplot(total_rows, 3, 2); imshow(V_enhanced); title('② CLAHE 增强 V 通道');
     
     % ③ 形态学纯化红色掩膜
-    subplot(2, 3, 3); imshow(mask_final);
+    subplot(total_rows, 3, 3); imshow(mask_final);
     title(sprintf('③ 形态学纯化红色掩膜 [L%d]', ql));
     
     % Step 3: 逐候选标志处理 (提取、分割、识别)
@@ -130,29 +133,32 @@ function process_single_image(origin_img, img_name, templates)
         
         fprintf('  -> 标志 #%d [L%d]: 识别结果 = %s km/h (置信度: %.1f%%)\n', k, ql, speed_val, confidence*100);
         
-        % 只详细展示第一个检测到的标志的中间过程
-        if k == 1 
-            % ④ ROI 仿射校正
-            subplot(2, 3, 4); imshow(roi_corrected); title('④ ROI 仿射校正');
-            
-            % ⑤ 内部二值化与去噪
-            subplot(2, 3, 5); imshow(bw_clean); title('⑤ 内部二值化与去噪 (已取反)');
-            
-            % ⑥ 字符切片匹配 (在subplot(2,3,6)内手动布局子轴)
-            subplot(2, 3, 6); title(sprintf('⑥ 字符切片匹配 [%s]', speed_val)); axis off;
-            num_chars = length(char_cells);
-            if num_chars > 0
-                ax6_pos = get(gca, 'Position');
-                cell_w = ax6_pos(3) / num_chars;
-                for c = 1:num_chars
-                    pos = [ax6_pos(1) + (c-1)*cell_w + cell_w*0.1, ...
-                           ax6_pos(2) + ax6_pos(4)*0.15, ...
-                           cell_w*0.7, ax6_pos(4)*0.7];
-                    ax_c = axes('Position', pos);
-                    imshow(char_cells{c});
-                    title(sprintf('C%d', c), 'FontSize', 8);
-                    axis off;
-                end
+        % 详细展示所有检测到的标志的中间过程
+        row_offset = (k-1) * 3;
+        
+        % ④ ROI 仿射校正
+        subplot(total_rows, 3, 4 + row_offset); imshow(roi_corrected); 
+        title(sprintf('④%d ROI#%d 校正 [%s]', k, k, speed_val));
+        
+        % ⑤ 内部二值化与去噪
+        subplot(total_rows, 3, 5 + row_offset); imshow(bw_clean); 
+        title(sprintf('⑤%d ROI#%d 二值化', k, k));
+        
+        % ⑥ 字符切片匹配 (手动布局子轴)
+        subplot(total_rows, 3, 6 + row_offset); 
+        title(sprintf('⑥%d ROI#%d 字符切片', k, k)); axis off;
+        num_chars = length(char_cells);
+        if num_chars > 0
+            ax6_pos = get(gca, 'Position');
+            cell_w = ax6_pos(3) / num_chars;
+            for c = 1:num_chars
+                pos = [ax6_pos(1) + (c-1)*cell_w + cell_w*0.1, ...
+                       ax6_pos(2) + ax6_pos(4)*0.15, ...
+                       cell_w*0.7, ax6_pos(4)*0.7];
+                ax_c = axes('Position', pos);
+                imshow(char_cells{c});
+                title(sprintf('C%d', c), 'FontSize', 8);
+                axis off;
             end
         end
     end
